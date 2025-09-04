@@ -410,27 +410,27 @@ elif st.session_state.app_mode == "Download Direto de Vídeo":
 
             st.info(f"Obtendo informações para: {st.session_state.direct_video_url}...")
             
-            video_url = st.session_state.direct_video_url # Renomeado para evitar conflito com 'url' de loops
-            video_info = get_video_info(video_url)
-            page_title_raw = get_page_title(video_url) # Usar get_page_title para o título
+            video_url_to_process = st.session_state.direct_video_url # Use uma nova variável para clareza
+            video_info = get_video_info(video_url_to_process)
+            page_title_raw = get_page_title(video_url_to_process) # Usar get_page_title para o título
 
             current_video_number = st.session_state.base_number # Para um download direto, começa com o base_number
             
             all_formats = parse_all_formats_in_range(video_info)
 
-            st.session_state.processed_videos_data[video_url] = {
-                "display_name": f"{page_title_raw} - {video_url}",
-                "url": video_url,
+            st.session_state.processed_videos_data[video_url_to_process] = { # Use a nova variável aqui
+                "display_name": f"{page_title_raw} - {video_url_to_process}",
+                "url": video_url_to_process,
                 "page_title_raw": page_title_raw,
                 "current_video_number": current_video_number,
                 "video_info": video_info,
                 "all_formats": all_formats,
             }
             if video_info and all_formats:
-                st.session_state.download_statuses[video_url] = 'pending' # CORRIGIDO: Usando video_url
-                st.session_state[f"res_choice_{video_url}"] = all_formats[0]['display'] # CORRIGIDO: Usando video_url
+                st.session_state.download_statuses[video_url_to_process] = 'pending' # CORRIGIDO: Usando video_url_to_process
+                st.session_state[f"res_choice_{video_url_to_process}"] = all_formats[0]['display'] # CORRIGIDO: Usando video_url_to_process
             else:
-                st.session_state.download_statuses[video_url] = 'error_no_formats' # CORRIGIDO: Usando video_url
+                st.session_state.download_statuses[video_url_to_process] = 'error_no_formats' # CORRIGIDO: Usando video_url_to_process
 
             st.success("Informações de vídeo processadas!")
             st.rerun()
@@ -582,6 +582,13 @@ if st.session_state.processed_videos_data:
             if current_selected_display_format not in options_display_strings:
                 current_selected_display_format = options_display_strings[0] if options_display_strings else None
             
+            # Se ainda for None (lista vazia), não renderiza o selectbox. Isso deve ser pego pelo 'if not all_formats_for_video:'
+            if current_selected_display_format is None:
+                st.error(f"Erro interno: Não há opções de formato para {video_url} após a validação.")
+                st.markdown("---")
+                continue
+
+
             chosen_display_format = st.selectbox(
                 f"Selecione a qualidade para o vídeo {current_video_number}:",
                 options=options_display_strings,
