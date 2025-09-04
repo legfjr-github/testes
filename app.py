@@ -114,6 +114,7 @@ def get_video_info(url):
 def parse_all_formats_in_range(info_dict, min_height=144, max_height=1440):
     """
     Parses all available video formats from yt-dlp info_dict within a specified height range.
+    Includes relevant audio-only formats.
     Each option is a dict: {"display": str, "format_id": str, "height": int, "filesize_mb": float, "is_combined": bool}.
     """
     if not info_dict:
@@ -135,25 +136,29 @@ def parse_all_formats_in_range(info_dict, min_height=144, max_height=1440):
             if match:
                 height = int(match.group(1))
         
-        # Filtro de altura
-        if height is not None and (height < min_height or height > max_height):
-            # Se é um formato de áudio-only e não está no range de altura, vamos mantê-lo com height=0 para ordenar no final
-            if not (f.get('vcodec') == 'none' and f.get('acodec') != 'none'):
-                continue # Pula se está fora do range e não é áudio-only
+        is_audio_only = (f.get('vcodec') == 'none' and f.get('acodec') != 'none')
 
-        # Definir height=0 para formatos apenas de áudio, para ordenação
-        if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and (height is None or height > max_height):
+        # Filtro de altura para vídeo, permite áudio-only fora da faixa de altura de vídeo
+        if height is not None and not is_audio_only and (height < min_height or height > max_height):
+            continue # Pula formatos de vídeo fora do range especificado
+
+        # Para formatos apenas de áudio, definir height=0 para ordenação
+        if is_audio_only and height is None: # Se é áudio-only e não tem altura definida
             height = 0 # Força áudio-only para o final da lista, fora do range de vídeo
+        
+        # Filtrar áudio-only que não tem info de tamanho/bitrate (provavelmente irrelevante)
+        if is_audio_only and not f.get('tbr') and not f.get('filesize') and not f.get('filesize_approx'):
+            continue
 
         filesize_bytes = f.get('filesize') or f.get('filesize_approx')
         filesize_mb = filesize_bytes / (1024 * 1024) if filesize_bytes else None
         
         resolution_str = ""
-        if height and height > 0:
+        if height is not None and height > 0:
             resolution_str = f"{height}p"
             if f.get('fps'):
                 resolution_str += f"@{f['fps']}fps"
-        elif height == 0 or (f.get('vcodec') == 'none' and f.get('acodec') != 'none'):
+        elif is_audio_only:
             resolution_str = "Áudio" # Para formatos apenas de áudio
         
         display_string = f"{resolution_str}"
@@ -405,7 +410,7 @@ elif st.session_state.app_mode == "Download Direto de Vídeo":
 
             st.info(f"Obtendo informações para: {st.session_state.direct_video_url}...")
             
-            video_url = st.session_state.direct_video_url
+            video_url = st.session_state.direct_video_url # Renomeado para evitar conflito com 'url' de loops
             video_info = get_video_info(video_url)
             page_title_raw = get_page_title(video_url) # Usar get_page_title para o título
 
@@ -422,10 +427,10 @@ elif st.session_state.app_mode == "Download Direto de Vídeo":
                 "all_formats": all_formats,
             }
             if video_info and all_formats:
-                st.session_state.download_statuses[url] = 'pending'
-                st.session_state[f"res_choice_{url}"] = all_formats[0]['display'] # Garante que sempre é uma opção válida
+                st.session_state.download_statuses[video_url] = 'pending' # CORRIGIDO: Usando video_url
+                st.session_state[f"res_choice_{video_url}"] = all_formats[0]['display'] # CORRIGIDO: Usando video_url
             else:
-                st.session_state.download_statuses[url] = 'error_no_formats'
+                st.session_state.download_statuses[video_url] = 'error_no_formats' # CORRIGIDO: Usando video_url
 
             st.success("Informações de vídeo processadas!")
             st.rerun()
@@ -447,8 +452,8 @@ if st.session_state.processed_videos_data:
         
         # Atualiza a barra de progresso e texto
         completed_count = 0
-        for url in sorted_processed_urls: # Itera por todos para contar corretamente
-            status = st.session_state.download_statuses.get(url)
+        for url_in_data in sorted_processed_urls: # Itera por todos para contar corretamente
+            status = st.session_state.download_statuses.get(url_in_data)
             if status in ('completed', 'error', 'error_info_fetch', 'error_no_formats'):
                 completed_count += 1
         
@@ -704,6 +709,7 @@ else: # Caso processed_videos_data esteja vazio ou o modo não esteja ativo
         st.info("Selecione os vídeos e clique em 'Processar Vídeos Selecionados' para ver os detalhes e opções de download.")
     elif st.session_state.app_mode == "Download Direto de Vídeo" and not st.session_state.processed_videos_data:
         st.info("Insira um link direto de vídeo e clique em 'Processar Link Direto'.")
+        
 # # import streamlit as st
 # # import requests
 # # from bs4 import BeautifulSoup
