@@ -6,6 +6,7 @@ import os
 import re
 from urllib.parse import urljoin
 import concurrent.futures # Para execução paralela de busca de títulos e infos
+import time # Para simular um atraso no download se necessário
 
 # --- Configurações Iniciais ---
 DOWNLOAD_DIR = "downloads"
@@ -29,20 +30,6 @@ if 'base_name' not in st.session_state:
     st.session_state.base_name = "VideoBase"
 if 'base_number' not in st.session_state:
     st.session_state.base_number = 50
-if 'search_text_for_links' not in st.session_state:
-    st.session_state.search_text_for_links = "view_video" # Texto a ser procurado nos links
-
-# Link modification parameters
-if 'link_mod_first_keep' not in st.session_state:
-    st.session_state.link_mod_first_keep = ""
-if 'link_mod_last_keep' not in st.session_state:
-    st.session_state.link_mod_last_keep = ""
-if 'link_mod_text_to_remove' not in st.session_state:
-    st.session_state.link_mod_text_to_remove = ""
-if 'apply_link_modification' not in st.session_state:
-    st.session_state.apply_link_modification = False
-
-
 if 'available_video_options' not in st.session_state:
     st.session_state.available_video_options = [] # Armazena (display_string, url, page_title_raw)
 if 'selected_video_display_names' not in st.session_state:
@@ -50,19 +37,13 @@ if 'selected_video_display_names' not in st.session_state:
 if 'processed_videos_data' not in st.session_state:
     st.session_state.processed_videos_data = {} # Armazena dados completos dos vídeos selecionados após "Processar"
 if 'download_statuses' not in st.session_state:
-    st.session_state.download_statuses = {} # Armazena o status do download para cada URL (pending, downloading, completed, error, error_info_fetch, error_no_formats)
+    st.session_state.download_statuses = {} # Armazena o status do download para cada URL (pending, downloading, completed, error)
 if 'downloaded_files' not in st.session_state:
     st.session_state.downloaded_files = {} # Armazena os caminhos dos arquivos baixados
-
-# Batch download specific states
+if 'start_batch_download' not in st.session_state:
+    st.session_state.start_batch_download = False
 if 'batch_download_in_progress' not in st.session_state:
     st.session_state.batch_download_in_progress = False
-if 'batch_download_queue' not in st.session_state:
-    st.session_state.batch_download_queue = [] # URLs a serem baixadas no lote
-if 'batch_current_index' not in st.session_state:
-    st.session_state.batch_current_index = 0 # Índice do vídeo atual no lote
-if 'batch_total_videos' not in st.session_state:
-    st.session_state.batch_total_videos = 0 # Total de vídeos no lote
 
 # --- Funções Auxiliares ---
 
@@ -105,74 +86,55 @@ def get_video_info(url):
             info = ydl.extract_info(url, download=False)
             return info
     except yt_dlp.utils.DownloadError as e:
-        # st.error(f"Não foi possível extrair informações do vídeo em {url}: {e}") # Evitar poluir logs
+        st.error(f"Não foi possível extrair informações do vídeo em {url}: {e}")
         return None
     except Exception as e:
-        # st.error(f"Erro inesperado ao obter informações do vídeo em {url}: {e}") # Evitar poluir logs
+        st.error(f"Erro inesperado ao obter informações do vídeo em {url}: {e}")
         return None
 
-def parse_all_formats_in_range(info_dict, min_height=144, max_height=1440):
+def parse_all_formats(info_dict):
     """
-    Parses all available video formats from yt-dlp info_dict within a specified height range.
-    Includes relevant audio-only formats.
-    Each option is a dict: {"display": str, "format_id": str, "height": int, "filesize_mb": float, "is_combined": bool}.
+    Parses all available video formats from yt-dlp info_dict and returns a sorted list of options.
+    Each option is a tuple: (display_string, format_id, filesize_mb, resolution_height).
     """
-    if not info_dict:
-        return []
-
     formats = info_dict.get('formats', [])
     parsed_options = []
 
     for f in formats:
-        # Filtrar formatos sem stream relevante ou com codecs desconhecidos
-        if f.get('vcodec') == 'none' and f.get('acodec') == 'none':
-            continue # Ignorar se não tem vídeo nem áudio
+        # Pular formatos sem vídeo ou apenas áudio (a menos que seja um formato específico com boa qualidade)
+        if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and not f.get('is_hls', False):
+            continue # Pula áudio-only a menos que seja um formato que queremos explicitamente
+        if f.get('vcodec') == 'none' and f.get('acodec') == 'none': # Pula se não tem nem vídeo nem áudio
+            continue
 
         height = f.get('height')
-        # Tentar inferir a altura de format_note se não estiver diretamente presente
+        # Algumas vezes a altura não está presente para formatos combinados ou adaptativos, tentar inferir
         if height is None:
             format_note = f.get('format_note', '')
             match = re.search(r'(\d{3,4})p', format_note)
             if match:
                 height = int(match.group(1))
-        
-        is_audio_only = (f.get('vcodec') == 'none' and f.get('acodec') != 'none')
 
-        # Filtro de altura para vídeo, permite áudio-only fora da faixa de altura de vídeo
-        if height is not None and not is_audio_only and (height < min_height or height > max_height):
-            continue # Pula formatos de vídeo fora do range especificado
-
-        # Para formatos apenas de áudio, definir height=0 para ordenação
-        if is_audio_only and height is None: # Se é áudio-only e não tem altura definida
-            height = 0 # Força áudio-only para o final da lista, fora do range de vídeo
-        
-        # Filtrar áudio-only que não tem info de tamanho/bitrate (provavelmente irrelevante)
-        if is_audio_only and not f.get('tbr') and not f.get('filesize') and not f.get('filesize_approx'):
+        if not height: # Ainda sem altura, pode ser um formato estranho, pular
             continue
 
         filesize_bytes = f.get('filesize') or f.get('filesize_approx')
         filesize_mb = filesize_bytes / (1024 * 1024) if filesize_bytes else None
         
-        resolution_str = ""
-        if height is not None and height > 0:
-            resolution_str = f"{height}p"
-            if f.get('fps'):
-                resolution_str += f"@{f['fps']}fps"
-        elif is_audio_only:
-            resolution_str = "Áudio" # Para formatos apenas de áudio
-        
-        display_string = f"{resolution_str}"
-        
-        is_combined = (f.get('vcodec') != 'none' and f.get('acodec') != 'none')
+        # Cria uma string de exibição clara
+        resolution_str = f"{height}p"
+        if f.get('fps'):
+            resolution_str += f"@{f['fps']}fps"
 
+        display_string = f"{resolution_str}"
         if f.get('vcodec') and f['vcodec'] != 'none':
             display_string += f" ({f['vcodec']}"
             if f.get('acodec') and f['acodec'] != 'none':
                 display_string += f" + {f['acodec']})"
             else:
-                display_string += " apenas vídeo)"
+                display_string += " - apenas vídeo)"
         elif f.get('acodec') and f['acodec'] != 'none':
-            display_string += f" ({f['acodec']} apenas áudio)"
+            display_string += f" (apenas áudio - {f['acodec']})"
         
         if filesize_mb is not None:
             display_string += f" - {filesize_mb:.2f} MB"
@@ -184,30 +146,20 @@ def parse_all_formats_in_range(info_dict, min_height=144, max_height=1440):
             "format_id": f['format_id'],
             "height": height,
             "filesize_mb": filesize_mb,
-            "is_combined": is_combined,
-            "tbr": f.get('tbr') # Incluir tbr para ordenação mais precisa
+            "is_combined": (f.get('vcodec') != 'none' and f.get('acodec') != 'none') # Indica se tem áudio e vídeo
         })
     
-    # Ordenar:
-    # 1. Por altura (maior para menor), tratando áudio-only (height=0) por último.
-    # 2. Depois se é combinado (True primeiro).
-    # 3. Depois por bitrate (tbr, maior primeiro) para mesma altura/combinado.
-    parsed_options.sort(key=lambda x: (
-        x['height'] if x['height'] is not None else -1, # Altura 0 ou None para áudio-only vai para o final
-        x['is_combined'], # True (combinado) vem depois de False na ordenação padrão. Para ter combinado antes, invertemos o efeito
-        x['tbr'] if x['tbr'] is not None else -1 # Maior bitrate primeiro
-    ), reverse=True) # reverter para ter altura maior primeiro e bitrate maior primeiro
-
+    # Ordenar por altura descendente, e depois por tamanho/bitrate (implícito na ordem do yt-dlp)
+    # Preferir formatos combinados (áudio+vídeo) se houver opções separadas
+    parsed_options.sort(key=lambda x: (x['height'] if x['height'] else 0, x['is_combined'], x['filesize_mb'] if x['filesize_mb'] else 0), reverse=True)
+    
     return parsed_options
-
 
 # --- Callbacks para atualização de estado ---
 def update_selected_videos_multiselect():
-    # Este callback é chamado quando o multiselect muda.
-    # Ele copia o valor do widget para a variável de estado que usamos.
     st.session_state.selected_video_display_names = st.session_state.video_multiselect_value
 
-# --- UI Render ---
+# --- Interface do Streamlit ---
 
 st.sidebar.header("Configurações do Aplicativo")
 st.session_state.app_mode = st.sidebar.radio(
@@ -220,20 +172,10 @@ st.sidebar.subheader("Detalhes de Nomeação dos Arquivos")
 st.session_state.base_name = st.sidebar.text_input("Nome Base para o Vídeo:", st.session_state.base_name, key="base_name_input_sidebar")
 st.session_state.base_number = st.sidebar.number_input("Número Base para o Vídeo (será incrementado):", min_value=1, value=st.session_state.base_number, key="base_number_input_sidebar")
 
+
 if st.session_state.app_mode == "Procurar Links no Site":
     st.header("1. Procurar Links em Site")
     st.session_state.main_url = st.text_input("Link do Site (URL principal):", st.session_state.main_url, key="main_url_input")
-    st.session_state.search_text_for_links = st.text_input("Texto para buscar em links (ex: 'view_video'):", st.session_state.search_text_for_links, key="search_text_input")
-
-    st.subheader("Modificação de Links (Opcional)")
-    st.session_state.apply_link_modification = st.checkbox("Aplicar modificação nos links encontrados?", value=st.session_state.apply_link_modification, key="apply_link_mod_checkbox")
-
-    if st.session_state.apply_link_modification:
-        st.session_state.link_mod_first_keep = st.text_input("Primeira parte a manter (antes da remoção):", st.session_state.link_mod_first_keep, key="link_mod_first_keep_input")
-        st.session_state.link_mod_text_to_remove = st.text_input("Texto exato a remover:", st.session_state.link_mod_text_to_remove, key="link_mod_text_to_remove_input")
-        st.session_state.link_mod_last_keep = st.text_input("Última parte a manter (depois da remoção):", st.session_state.link_mod_last_keep, key="link_mod_last_keep_input")
-        st.info("Exemplo: Link `//pt.po/video1`. Se 'Primeira parte'=`//`, 'Texto a remover'=`pt.`, 'Última parte'=`po`, resultará em `//po/video1`.")
-
 
     if st.button("Buscar Links de Vídeo"):
         # Limpa estados anteriores ao buscar novos links
@@ -242,16 +184,13 @@ if st.session_state.app_mode == "Procurar Links no Site":
         st.session_state.processed_videos_data = {}
         st.session_state.download_statuses = {}
         st.session_state.downloaded_files = {}
+        st.session_state.start_batch_download = False
         st.session_state.batch_download_in_progress = False
-        st.session_state.batch_download_queue = []
-        st.session_state.batch_current_index = 0
-        st.session_state.batch_total_videos = 0
         
         main_url_to_fetch = st.session_state.main_url
-        search_text = st.session_state.search_text_for_links
 
-        if main_url_to_fetch and search_text:
-            st.info(f"Buscando links em: {main_url_to_fetch} contendo '{search_text}'...")
+        if main_url_to_fetch:
+            st.info(f"Buscando links em: {main_url_to_fetch}...")
             try:
                 response = requests.get(main_url_to_fetch, timeout=15)
                 response.raise_for_status()
@@ -262,34 +201,11 @@ if st.session_state.app_mode == "Procurar Links no Site":
                     href = a_tag['href']
                     full_href = urljoin(main_url_to_fetch, href)
                     
-                    if search_text in full_href:
+                    if 'view_video' in full_href:
                         unique_video_urls.add(full_href)
                 
-                # --- Aplicar Modificação nos Links, se solicitado ---
-                modified_urls_list = [] # Usar lista para preservar ordem, se for o caso
-                if st.session_state.apply_link_modification and st.session_state.link_mod_first_keep and st.session_state.link_mod_text_to_remove and st.session_state.link_mod_last_keep:
-                    st.info("Aplicando modificação nos links encontrados...")
-                    first_k = re.escape(st.session_state.link_mod_first_keep)
-                    text_r = re.escape(st.session_state.link_mod_text_to_remove)
-                    last_k = re.escape(st.session_state.link_mod_last_keep)
-                    
-                    # Regex para encontrar "primeira_manter" + "remover" + "ultima_manter"
-                    # E substituir por "primeira_manter" + "ultima_manter"
-                    pattern = rf"({first_k}){text_r}({last_k})"
-                    
-                    for url in unique_video_urls:
-                        modified_url = re.sub(pattern, r"\1\2", url) # \1 é first_k, \2 é last_k
-                        modified_urls_list.append(modified_url)
-                    
-                    # Usa os links modificados para o resto do processamento, removendo duplicatas novamente
-                    unique_video_urls = set(modified_urls_list)
-                    st.success(f"Modificação aplicada em {len(modified_urls_list)} links.")
-                elif st.session_state.apply_link_modification:
-                     st.warning("A modificação de links está ativada, mas um ou mais campos (Primeira parte, Texto a remover, Última parte) estão vazios. A modificação não será aplicada.")
-
-
                 if unique_video_urls:
-                    st.write("Obtendo títulos das páginas (executando em paralelo)...")
+                    st.write("Obtendo títulos das páginas (isso pode levar um tempo, executando em paralelo)...")
                     progress_bar = st.progress(0)
                     progress_text = st.empty()
                     total_links = len(unique_video_urls)
@@ -314,25 +230,24 @@ if st.session_state.app_mode == "Procurar Links no Site":
                     st.session_state.available_video_options = links_with_titles
                     progress_bar.empty()
                     progress_text.empty()
-                    st.success(f"Encontrados e processados {len(st.session_state.available_video_options)} links únicos contendo '{search_text}'.")
+                    st.success(f"Encontrados e processados {len(st.session_state.available_video_options)} links únicos com 'view_video'.")
                 else:
-                    st.warning(f"Nenhum link contendo '{search_text}' encontrado nesta página.")
+                    st.warning("Nenhum link com 'view_video' encontrado nesta página.")
             except requests.exceptions.RequestException as e:
                 st.error(f"Erro ao acessar a URL principal: {e}")
         else:
-            st.warning("Por favor, insira uma URL válida e o texto para buscar nos links.")
+            st.warning("Por favor, insira uma URL válida para buscar os links.")
 
     st.header("2. Selecione os Vídeos para Processar")
     if st.session_state.available_video_options:
         display_options = [item[0] for item in st.session_state.available_video_options]
         
-        # st.multiselect com on_change para corrigir o problema de 2 cliques
         st.multiselect(
             "Selecione os vídeos que você deseja baixar:",
             options=display_options,
             default=st.session_state.selected_video_display_names,
-            key="video_multiselect_value", # A chave do widget armazena o valor aqui
-            on_change=update_selected_videos_multiselect # Callback para atualizar st.session_state.selected_video_display_names
+            key="video_multiselect_value",
+            on_change=update_selected_videos_multiselect
         )
         
         selected_video_data = [
@@ -348,9 +263,6 @@ if st.session_state.app_mode == "Procurar Links no Site":
                 st.session_state.download_statuses = {}
                 st.session_state.downloaded_files = {}
                 st.session_state.batch_download_in_progress = False
-                st.session_state.batch_download_queue = []
-                st.session_state.batch_current_index = 0
-                st.session_state.batch_total_videos = 0
 
                 st.info("Obtendo informações de vídeo (formatos e tamanhos) em paralelo...")
                 info_progress_bar = st.progress(0)
@@ -368,23 +280,22 @@ if st.session_state.app_mode == "Procurar Links no Site":
                         video_info = future.result()
                         current_video_number = st.session_state.base_number + idx 
 
-                        all_formats = parse_all_formats_in_range(video_info)
-
                         st.session_state.processed_videos_data[url] = {
                             "display_name": video_item[0],
                             "url": url,
                             "page_title_raw": title_raw,
                             "current_video_number": current_video_number,
                             "video_info": video_info,
-                            "all_formats": all_formats,
+                            "all_formats": parse_all_formats(video_info) if video_info else []
                         }
-                        if video_info and all_formats:
+                        if video_info:
                             st.session_state.download_statuses[url] = 'pending'
-                            # Define o valor inicial para o selectbox
-                            st.session_state[f"res_choice_{url}"] = all_formats[0]['display'] # Garante que sempre é uma opção válida
+                            # Salva a primeira opção como default para o radio de resolução
+                            if st.session_state.processed_videos_data[url]["all_formats"]:
+                                st.session_state[f"res_choice_{url}"] = st.session_state.processed_videos_data[url]["all_formats"][0]['display']
                         else:
-                            st.session_state.download_statuses[url] = 'error_no_formats'
-                        
+                            st.session_state.download_statuses[url] = 'error_info_fetch'
+
                         info_progress_bar.progress((idx + 1) / total_selected)
                         info_progress_text.text(f"Processando informações de vídeo: {idx + 1}/{total_selected} vídeos.")
 
@@ -403,34 +314,29 @@ elif st.session_state.app_mode == "Download Direto de Vídeo":
             st.session_state.processed_videos_data = {}
             st.session_state.download_statuses = {}
             st.session_state.downloaded_files = {}
+            st.session_state.start_batch_download = False
             st.session_state.batch_download_in_progress = False
-            st.session_state.batch_download_queue = []
-            st.session_state.batch_current_index = 0
-            st.session_state.batch_total_videos = 0
 
             st.info(f"Obtendo informações para: {st.session_state.direct_video_url}...")
             
-            video_url_to_process = st.session_state.direct_video_url # Use uma nova variável para clareza
-            video_info = get_video_info(video_url_to_process)
-            page_title_raw = get_page_title(video_url_to_process) # Usar get_page_title para o título
-
-            current_video_number = st.session_state.base_number # Para um download direto, começa com o base_number
+            video_url = st.session_state.direct_video_url
+            video_info = get_video_info(video_url)
+            page_title_raw = get_page_title(video_url)
             
-            all_formats = parse_all_formats_in_range(video_info)
-
-            st.session_state.processed_videos_data[video_url_to_process] = { # Use a nova variável aqui
-                "display_name": f"{page_title_raw} - {video_url_to_process}",
-                "url": video_url_to_process,
+            st.session_state.processed_videos_data[video_url] = {
+                "display_name": f"{page_title_raw} - {video_url}",
+                "url": video_url,
                 "page_title_raw": page_title_raw,
-                "current_video_number": current_video_number,
+                "current_video_number": st.session_state.base_number,
                 "video_info": video_info,
-                "all_formats": all_formats,
+                "all_formats": parse_all_formats(video_info) if video_info else []
             }
-            if video_info and all_formats:
-                st.session_state.download_statuses[video_url_to_process] = 'pending' # CORRIGIDO: Usando video_url_to_process
-                st.session_state[f"res_choice_{video_url_to_process}"] = all_formats[0]['display'] # CORRIGIDO: Usando video_url_to_process
+            if video_info:
+                st.session_state.download_statuses[video_url] = 'pending'
+                if st.session_state.processed_videos_data[video_url]["all_formats"]:
+                    st.session_state[f"res_choice_{video_url}"] = st.session_state.processed_videos_data[video_url]["all_formats"][0]['display']
             else:
-                st.session_state.download_statuses[video_url_to_process] = 'error_no_formats' # CORRIGIDO: Usando video_url_to_process
+                st.session_state.download_statuses[video_url] = 'error_info_fetch'
 
             st.success("Informações de vídeo processadas!")
             st.rerun()
@@ -445,109 +351,95 @@ if st.session_state.processed_videos_data:
                                    key=lambda u: st.session_state.processed_videos_data[u]['current_video_number'])
     
     # --- Lógica de Download em Lote (Batch Download) ---
+    if st.session_state.start_batch_download and not st.session_state.batch_download_in_progress:
+        st.session_state.batch_download_in_progress = True
+        st.session_state.start_batch_download = False # Reseta a flag para evitar loop
+        st.rerun() # Re-executa para iniciar o download em lote
+    
     if st.session_state.batch_download_in_progress:
-        # Recupera o estado do download em lote
+        st.info("Download em lote em progresso... Por favor, não feche esta página.")
         batch_progress_bar = st.progress(0)
         batch_status_text = st.empty()
         
-        # Atualiza a barra de progresso e texto
-        completed_count = 0
-        for url_in_data in sorted_processed_urls: # Itera por todos para contar corretamente
-            status = st.session_state.download_statuses.get(url_in_data)
-            if status in ('completed', 'error', 'error_info_fetch', 'error_no_formats'):
-                completed_count += 1
+        total_videos_to_download = len(sorted_processed_urls)
+        completed_downloads_count = 0
         
-        if st.session_state.batch_total_videos > 0:
-            batch_progress_bar.progress(completed_count / st.session_state.batch_total_videos)
-            batch_status_text.text(f"Progresso do lote: {completed_count}/{st.session_state.batch_total_videos} vídeos processados.")
+        for idx, video_url in enumerate(sorted_processed_urls):
+            video_data = st.session_state.processed_videos_data[video_url]
+            current_download_status = st.session_state.download_statuses.get(video_url)
+            
+            if current_download_status in ('completed', 'error', 'error_info_fetch'):
+                completed_downloads_count += 1
+                batch_progress_bar.progress(completed_downloads_count / total_videos_to_download)
+                batch_status_text.text(f"Baixando vídeos: {completed_downloads_count}/{total_videos_to_download} concluídos (ou com status final).")
+                continue # Pula vídeos já processados
+            
+            # Pega a resolução escolhida que foi salva no st.session_state
+            chosen_display_format = st.session_state.get(f"res_choice_{video_url}", None)
+            
+            if not chosen_display_format:
+                st.error(f"Nenhuma qualidade selecionada para o vídeo {video_data['page_title_raw']}. Pulando.")
+                st.session_state.download_statuses[video_url] = 'error'
+                completed_downloads_count += 1
+                batch_progress_bar.progress(completed_downloads_count / total_videos_to_download)
+                continue
 
-        if st.session_state.batch_current_index < st.session_state.batch_total_videos:
-            # Tentar processar o próximo vídeo na fila
-            video_url_to_download = st.session_state.batch_download_queue[st.session_state.batch_current_index]
-            current_status = st.session_state.download_statuses.get(video_url_to_download)
+            # Encontrar o format_id correspondente
+            selected_format_info = next((f for f in video_data['all_formats'] if f['display'] == chosen_display_format), None)
+            
+            if not selected_format_info:
+                st.error(f"Qualidade selecionada '{chosen_display_format}' não encontrada para {video_data['page_title_raw']}. Pulando.")
+                st.session_state.download_statuses[video_url] = 'error'
+                completed_downloads_count += 1
+                batch_progress_bar.progress(completed_downloads_count / total_videos_to_download)
+                continue
 
-            if current_status not in ('completed', 'error', 'error_info_fetch', 'error_no_formats'):
-                # Processar este vídeo
-                video_data = st.session_state.processed_videos_data[video_url_to_download]
-                
-                # Pega a resolução escolhida que foi salva no st.session_state (do selectbox)
-                chosen_display_format = st.session_state.get(f"res_choice_{video_url_to_download}", None)
-                
-                if not chosen_display_format:
-                    st.error(f"Erro no lote: Nenhuma qualidade selecionada para o vídeo {video_data['page_title_raw']}. Pulando.")
-                    st.session_state.download_statuses[video_url_to_download] = 'error'
-                    st.session_state.batch_current_index += 1
-                    st.rerun()
+            chosen_format_id = selected_format_info['format_id']
+            
+            page_title_raw = video_data['page_title_raw']
+            clean_page_title = clean_filename(page_title_raw)
+            final_filename_base = f"{st.session_state.base_name}{video_data['current_video_number']} {clean_page_title}"
+            output_filename = f"{final_filename_base}_{chosen_display_format.split(' - ')[0]}.mp4" # Usa parte da string de display
+            output_filepath = os.path.join(DOWNLOAD_DIR, output_filename)
 
-                selected_format_info = next((f for f in video_data['all_formats'] if f['display'] == chosen_display_format), None)
+            st.session_state.download_statuses[video_url] = 'downloading'
+            batch_status_text.text(f"Baixando ({completed_downloads_count+1}/{total_videos_to_download}): '{output_filename}'...")
+            
+            try:
+                # Usar o format_id específico para o yt-dlp
+                ydl_opts = {
+                    'format': chosen_format_id,
+                    'outtmpl': output_filepath,
+                    'noplaylist': True,
+                    'quiet': True,
+                    'retries': 5,
+                    'merge_output_format': 'mp4' # Força a mesclagem para mp4 se for vídeo+áudio separado
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_url])
                 
-                if not selected_format_info:
-                    st.error(f"Erro no lote: Qualidade selecionada '{chosen_display_format}' não encontrada para {video_data['page_title_raw']}. Pulando.")
-                    st.session_state.download_statuses[video_url_to_download] = 'error'
-                    st.session_state.batch_current_index += 1
-                    st.rerun()
+                st.session_state.download_statuses[video_url] = 'completed'
+                st.session_state.downloaded_files[video_url] = output_filepath
+                completed_downloads_count += 1
+                batch_progress_bar.progress(completed_downloads_count / total_videos_to_download)
+                batch_status_text.text(f"Baixando vídeos: {completed_downloads_count}/{total_videos_to_download} concluídos.")
+            except Exception as e:
+                st.error(f"Erro ao baixar '{output_filename}': {e}")
+                st.session_state.download_statuses[video_url] = 'error'
+                completed_downloads_count += 1 # Conta como processado, mesmo com erro
+                batch_progress_bar.progress(completed_downloads_count / total_videos_to_download)
+                batch_status_text.text(f"Baixando vídeos: {completed_downloads_count}/{total_videos_to_download} concluídos (com erro).")
 
-                chosen_format_id = selected_format_info['format_id']
-                
-                clean_page_title = clean_filename(video_data['page_title_raw'])
-                filename_qual_part = chosen_display_format.split(' - ')[0]
-                final_filename_base = f"{st.session_state.base_name}{video_data['current_video_number']} {clean_page_title}"
-                output_filename = f"{final_filename_base}_{filename_qual_part}.mp4"
-                output_filepath = os.path.join(DOWNLOAD_DIR, output_filename)
-
-                st.session_state.download_statuses[video_url_to_download] = 'downloading'
-                batch_status_text.text(f"Baixando ({st.session_state.batch_current_index + 1}/{st.session_state.batch_total_videos}): '{output_filename}'...")
-                
-                try:
-                    ydl_opts = {
-                        'format': chosen_format_id, # Usar o format_id específico
-                        'outtmpl': output_filepath,
-                        'noplaylist': True,
-                        'quiet': True,
-                        'retries': 5,
-                        'merge_output_format': 'mp4'
-                    }
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([video_url_to_download])
-                    
-                    st.session_state.download_statuses[video_url_to_download] = 'completed'
-                    st.session_state.downloaded_files[video_url_to_download] = output_filepath
-                    
-                except Exception as e:
-                    st.error(f"Erro ao baixar '{output_filename}' no lote: {e}")
-                    st.session_state.download_statuses[video_url_to_download] = 'error'
-                
-                st.session_state.batch_current_index += 1
-                st.rerun() # Re-executa para processar o próximo vídeo ou finalizar
-            else: # Vídeo já está em estado final (completed, error, etc.) na fila
-                st.session_state.batch_current_index += 1
-                st.rerun() # Pula para o próximo
-        else:
-            # Todos os vídeos na fila de lote foram processados
-            st.session_state.batch_download_in_progress = False
-            st.session_state.batch_download_queue = [] # Limpa a fila
-            st.session_state.batch_current_index = 0
-            st.success("Download em lote concluído. Verifique o status de cada vídeo abaixo.")
-            st.rerun() # Refresh UI para mostrar estados finais
+        st.session_state.batch_download_in_progress = False
+        st.success("Download em lote concluído. Verifique o status de cada vídeo abaixo.")
+        st.rerun() # Refresh UI to show final states
     else:
-        # Botão para iniciar o download em lote
         if st.button("Baixar TODOS os vídeos selecionados", key="batch_download_btn"):
             if not st.session_state.processed_videos_data:
                 st.warning("Nenhum vídeo processado para baixar.")
             else:
-                # Reinicializa a fila e os contadores para um novo lote
-                st.session_state.batch_download_queue = [
-                    url for url in sorted_processed_urls
-                    if st.session_state.download_statuses.get(url) not in ('completed', 'error', 'error_info_fetch', 'error_no_formats')
-                ]
-                st.session_state.batch_total_videos = len(st.session_state.batch_download_queue)
-                st.session_state.batch_current_index = 0
-
-                if st.session_state.batch_total_videos > 0:
-                    st.session_state.batch_download_in_progress = True
-                    st.rerun()
-                else:
-                    st.info("Todos os vídeos selecionados já foram baixados ou apresentaram erro final.")
+                st.session_state.start_batch_download = True
+                st.rerun()
 
     st.markdown("---") # Separador para o botão de lote
 
@@ -567,33 +459,19 @@ if st.session_state.processed_videos_data:
 
         if video_info:
             if not all_formats_for_video:
-                st.warning("Nenhuma qualidade de vídeo disponível (144p-1440p) detectada para esta URL.")
-                if download_status not in ('error_no_formats', 'error_info_fetch'):
-                    st.session_state.download_statuses[video_url] = 'error_no_formats'
+                st.warning("Nenhuma qualidade de vídeo disponível detectada para esta URL.")
                 st.markdown("---")
                 continue
 
-            # Garante que a escolha de resolução persista e use `value` para st.selectbox
-            current_selected_display_format = st.session_state.get(f"res_choice_{video_url}", None)
+            # Garante que a escolha de resolução persista
+            default_display_format = st.session_state.get(f"res_choice_{video_url}", all_formats_for_video[0]['display'])
             
-            options_display_strings = [f['display'] for f in all_formats_for_video]
-
-            # Se a seleção atual não for válida ou não estiver mais disponível, use a primeira opção
-            if current_selected_display_format not in options_display_strings:
-                current_selected_display_format = options_display_strings[0] if options_display_strings else None
-            
-            # Se ainda for None (lista vazia), não renderiza o selectbox. Isso deve ser pego pelo 'if not all_formats_for_video:'
-            if current_selected_display_format is None:
-                st.error(f"Erro interno: Não há opções de formato para {video_url} após a validação.")
-                st.markdown("---")
-                continue
-
-
+            # Usar st.selectbox para mostrar todas as opções de qualidade
             chosen_display_format = st.selectbox(
                 f"Selecione a qualidade para o vídeo {current_video_number}:",
-                options=options_display_strings,
-                value=current_selected_display_format,
-                key=f"res_choice_{video_url}" # O valor do selectbox é automaticamente armazenado aqui
+                options=[f['display'] for f in all_formats_for_video],
+                index=[f['display'] for f in all_formats_for_video].index(default_display_format) if default_display_format in [f['display'] for f in all_formats_for_video] else 0,
+                key=f"res_choice_{video_url}"
             )
             
             # Encontrar o format_id correspondente
@@ -605,9 +483,10 @@ if st.session_state.processed_videos_data:
                 continue
             
             chosen_format_id = selected_format_info['format_id']
+            chosen_resolution_height = selected_format_info['height']
             
             # Nome de arquivo baseado na qualidade selecionada
-            filename_qual_part = chosen_display_format.split(' - ')[0] # Pega "1080p@30fps" ou "720p" ou "Áudio"
+            filename_qual_part = chosen_display_format.split(' - ')[0] # Pega "1080p@30fps" ou "720p"
             final_filename_base = f"{st.session_state.base_name}{current_video_number} {clean_page_title}"
             output_filename = f"{final_filename_base}_{filename_qual_part}.mp4"
             output_filepath = os.path.join(DOWNLOAD_DIR, output_filename)
@@ -616,11 +495,8 @@ if st.session_state.processed_videos_data:
 
             # --- Lógica do Botão de Download Individual ---
             if download_status == 'pending':
-                # Desabilita o botão individual se o download em lote estiver ativo
-                download_button_disabled = st.session_state.batch_download_in_progress
-                if st.button(f"Baixar '{chosen_display_format}' de '{clean_page_title}'", key=f"download_btn_{video_url}", disabled=download_button_disabled):
+                if st.button(f"Baixar '{chosen_display_format}' de '{clean_page_title}'", key=f"download_btn_{video_url}"):
                     st.session_state.download_statuses[video_url] = 'downloading'
-                    # Armazena informações específicas para o download
                     st.session_state.processed_videos_data[video_url]['output_filepath'] = output_filepath
                     st.session_state.processed_videos_data[video_url]['chosen_format_id'] = chosen_format_id
                     st.session_state.processed_videos_data[video_url]['output_filename'] = output_filename
@@ -628,13 +504,9 @@ if st.session_state.processed_videos_data:
             elif download_status == 'downloading':
                 st.info(f"Download de '{output_filename}' em progresso...")
                 try:
-                    # Usar as informações salvas para garantir consistência
-                    dl_output_filepath = st.session_state.processed_videos_data[video_url]['output_filepath']
-                    dl_chosen_format_id = st.session_state.processed_videos_data[video_url]['chosen_format_id']
-                    
                     ydl_opts = {
-                        'format': dl_chosen_format_id, # Usar o format_id específico
-                        'outtmpl': dl_output_filepath,
+                        'format': chosen_format_id,
+                        'outtmpl': output_filepath,
                         'noplaylist': True,
                         'quiet': True,
                         'retries': 5,
@@ -646,7 +518,7 @@ if st.session_state.processed_videos_data:
                     
                     st.success(f"Vídeo '{output_filename}' baixado com sucesso!")
                     st.session_state.download_statuses[video_url] = 'completed'
-                    st.session_state.downloaded_files[video_url] = dl_output_filepath
+                    st.session_state.downloaded_files[video_url] = output_filepath
                     st.rerun()
                 except yt_dlp.utils.DownloadError as e:
                     st.error(f"Erro ao baixar o vídeo {output_filename}: {e}")
@@ -679,43 +551,35 @@ if st.session_state.processed_videos_data:
                             st.video(downloaded_file_path)
                 else:
                     st.error(f"Erro: O arquivo baixado não foi encontrado em {downloaded_file_path}. Por favor, verifique o diretório 'downloads'.")
-            elif download_status in ('error', 'error_info_fetch', 'error_no_formats'):
-                st.error(f"Ocorreu um erro ({download_status}) no download ou na obtenção de informações para este vídeo. Por favor, tente novamente ou verifique a URL.")
-                # Desabilita o botão de retry individual se o download em lote estiver ativo
-                retry_button_disabled = st.session_state.batch_download_in_progress
-                if st.button(f"Tentar Novamente '{clean_page_title}'", key=f"retry_download_btn_{video_url}", disabled=retry_button_disabled):
+            elif download_status == 'error' or download_status == 'error_info_fetch':
+                st.error(f"Ocorreu um erro no download ou na obtenção de informações para este vídeo. Por favor, tente novamente ou verifique a URL.")
+                if st.button(f"Tentar Novamente '{clean_page_title}'", key=f"retry_download_btn_{video_url}"):
                     # Limpa cache de info para re-tentar
                     get_video_info.clear() 
                     st.session_state.download_statuses[video_url] = 'pending'
                     st.rerun()
             
             st.markdown("---")
-        else: # Se video_info for None (erro ao buscar informações) ou não houver formatos
-            st.warning(f"Não foi possível obter informações de vídeo ou nenhum formato disponível para: {video_url}. Ignorando este vídeo.")
-            if download_status in ('error_info_fetch', 'error_no_formats'):
-                 # Desabilita o botão de retry individual se o download em lote estiver ativo
-                 retry_info_button_disabled = st.session_state.batch_download_in_progress
-                 if st.button(f"Tentar Novamente Obter Info '{clean_page_title}'", key=f"retry_info_btn_{video_url}", disabled=retry_info_button_disabled):
+        else: # Se video_info for None (erro ao buscar informações)
+            st.warning(f"Não foi possível obter informações de vídeo para: {video_url}. Ignorando este vídeo.")
+            if download_status == 'error_info_fetch':
+                 if st.button(f"Tentar Novamente Obter Info '{clean_page_title}'", key=f"retry_info_btn_{video_url}"):
                     get_video_info.clear() 
                     # Tenta re-obter info e reprocessa
                     video_data['video_info'] = get_video_info(video_url) 
-                    video_data['all_formats'] = parse_all_formats_in_range(video_data['video_info']) if video_data['video_info'] else []
-                    if video_data['video_info'] and video_data['all_formats']:
+                    video_data['all_formats'] = parse_all_formats(video_data['video_info']) if video_data['video_info'] else []
+                    if video_data['video_info']:
                          st.session_state.download_statuses[video_url] = 'pending'
-                         # Define a seleção padrão para o selectbox
-                         st.session_state[f"res_choice_{video_url}"] = video_data["all_formats"][0]['display']
-                    else:
-                        st.session_state.download_statuses[video_url] = 'error_no_formats' # Caso encontre info, mas não formatos
+                         if video_data["all_formats"]:
+                            st.session_state[f"res_choice_{video_url}"] = video_data["all_formats"][0]['display']
                     st.rerun()
             st.markdown("---")
 
-else: # Caso processed_videos_data esteja vazio ou o modo não esteja ativo
+else:
     if not st.session_state.available_video_options and not st.session_state.processed_videos_data and not st.session_state.batch_download_in_progress:
         st.info("Selecione um modo de operação na barra lateral para começar.")
-    elif st.session_state.app_mode == "Procurar Links no Site" and st.session_state.available_video_options and not st.session_state.processed_videos_data:
+    elif st.session_state.available_video_options and not st.session_state.processed_videos_data and not st.session_state.batch_download_in_progress:
         st.info("Selecione os vídeos e clique em 'Processar Vídeos Selecionados' para ver os detalhes e opções de download.")
-    elif st.session_state.app_mode == "Download Direto de Vídeo" and not st.session_state.processed_videos_data:
-        st.info("Insira um link direto de vídeo e clique em 'Processar Link Direto'.")
         
 # # import streamlit as st
 # # import requests
